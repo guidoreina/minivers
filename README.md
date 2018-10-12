@@ -48,3 +48,8 @@ Files with this file extension cannot be deleted, if you want to change this, ch
 
 
 Minivers can be used to protect against ransomware, as they search files with certain extensions (not tested though).
+
+Minivers logs the name of the executable which produced the change, to avoid this change the following `define`:
+```
+#define LOG_IMAGE_FILENAME     TRUE
+```

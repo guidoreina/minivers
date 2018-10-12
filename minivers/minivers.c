@@ -4,6 +4,9 @@
 
 #define DEFERRED_IO            TRUE
 #define IMMUTABLE_BACKUP_FILES TRUE
+#define LOG_IMAGE_FILENAME     TRUE
+
+#define EXE_MAX_LEN            (4 * 1024)
 
 static DRIVER_DATA driver_data;
 
@@ -53,6 +56,10 @@ static BOOLEAN duplicate_file(PFLT_CALLBACK_DATA CallbackData,
 static void deferred_io_workitem(PFLT_DEFERRED_IO_WORKITEM FltWorkItem,
                                  PFLT_CALLBACK_DATA CallbackData,
                                  PVOID Context);
+
+static BOOLEAN get_process_image_filename(PEPROCESS process,
+                                          void* buf,
+                                          size_t len);
 
 #ifdef ALLOC_PRAGMA
   #pragma alloc_text(INIT, DriverEntry)
@@ -168,22 +175,49 @@ NTSTATUS process_irp(PFLT_CALLBACK_DATA Data,
   PFLT_FILE_NAME_INFORMATION name_info;
   PFLT_DEFERRED_IO_WORKITEM work;
 
+#if LOG_IMAGE_FILENAME
+  PEPROCESS process;
+  ULONG pid;
+  char buf[sizeof(UNICODE_STRING) + (sizeof(WCHAR) * EXE_MAX_LEN)];
+  PUNICODE_STRING filename;
+#endif // LOG_IMAGE_FILENAME
+
   /* Get name information. */
   if (get_file_name_information(Data, &name_info)) {
     if (find_extension(&name_info->Extension)) {
+#if LOG_IMAGE_FILENAME
+      filename = (PUNICODE_STRING) buf;
+      filename->Buffer = (WCHAR*) (buf + sizeof(UNICODE_STRING));
+      filename->Length = 0;
+      filename->MaximumLength = EXE_MAX_LEN;
+
+      /* Get process image filename. */
+      if (((pid = FltGetRequestorProcessId(Data)) != 0) &&
+          ((process = FltGetRequestorProcess(Data)) != NULL) &&
+          (get_process_image_filename(process, buf, sizeof(buf)))) {
+        DbgPrint("[PID: %u, image: '%wZ'] Filename: '%wZ', extension: '%wZ'.",
+                 pid,
+                 filename,
+                 &name_info->Name,
+                 &name_info->Extension);
+      } else {
+        DbgPrint("Filename: '%wZ', extension: '%wZ'.",
+                 &name_info->Name,
+                 &name_info->Extension);
+      }
+#else
       DbgPrint("Filename: '%wZ', extension: '%wZ'.",
                &name_info->Name,
                &name_info->Extension);
+#endif
 
       if (deferred_io) {
         if ((work = FltAllocateDeferredIoWorkItem()) != NULL) {
-          if (NT_SUCCESS(FltQueueDeferredIoWorkItem(
-                           work,
-                           Data,
-                           deferred_io_workitem,
-                           DelayedWorkQueue,
-                           FltObjects->Instance
-                         ))) {
+          if (NT_SUCCESS(FltQueueDeferredIoWorkItem(work,
+                                                    Data,
+                                                    deferred_io_workitem,
+                                                    DelayedWorkQueue,
+                                                    FltObjects->Instance))) {
             FltReleaseFileNameInformation(name_info);
 
             *CompletionContext = NULL;
@@ -343,4 +377,54 @@ void deferred_io_workitem(PFLT_DEFERRED_IO_WORKITEM FltWorkItem,
   FltCompletePendedPreOperation(CallbackData,
                                 FLT_PREOP_SUCCESS_NO_CALLBACK,
                                 NULL);
+}
+
+BOOLEAN get_process_image_filename(PEPROCESS process, void* buf, size_t len)
+{
+  typedef NTSTATUS (*QueryInformationProcess)(HANDLE,
+                                              PROCESSINFOCLASS,
+                                              PVOID,
+                                              ULONG,
+                                              PULONG);
+
+  static QueryInformationProcess fnQueryInformationProcess = NULL;
+
+  HANDLE hProcess;
+  NTSTATUS status;
+
+  PAGED_CODE();
+
+  if (!fnQueryInformationProcess) {
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, L"ZwQueryInformationProcess");
+
+    /* Get a pointer to the function 'ZwQueryInformationProcess'. */
+    if ((fnQueryInformationProcess =
+         (QueryInformationProcess)
+         (ULONG_PTR) MmGetSystemRoutineAddress(&name)) == NULL) {
+      return FALSE;
+    }
+  }
+
+  /* Get process handle. */
+  if (!NT_SUCCESS(ObOpenObjectByPointer(process,
+                                        0,
+                                        NULL,
+                                        0,
+                                        0,
+                                        KernelMode,
+                                        &hProcess))) {
+    return FALSE;
+  }
+
+  /* Get process image filename. */
+  status = fnQueryInformationProcess(hProcess,
+                                     ProcessImageFileName,
+                                     buf,
+                                     len,
+                                     NULL);
+
+  ZwClose(hProcess);
+
+  return NT_SUCCESS(status);
 }
