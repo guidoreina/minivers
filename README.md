@@ -5,7 +5,7 @@ Minivers is a Windows file system minifilter driver which monitors changes in fi
 
 The file name of the backup files has the format:
 ```
-<original-filename>..YYYYMMDD_hhmmss_mmm.minivers
+<original-filename>.YYYYMMDD_hhmmss_mmm.minivers
 ```
 
 
