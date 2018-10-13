@@ -6,9 +6,21 @@
 #define IMMUTABLE_BACKUP_FILES TRUE
 #define LOG_IMAGE_FILENAME     TRUE
 
-#define EXE_MAX_LEN            (4 * 1024)
-
 static DRIVER_DATA driver_data;
+
+#if LOG_IMAGE_FILENAME
+  #define EXE_MAX_LEN            (4 * 1024)
+
+  /* Prototype of the function 'ZwQueryInformationProcess()'. */
+  typedef NTSTATUS (*QueryInformationProcess)(HANDLE,
+                                              PROCESSINFOCLASS,
+                                              PVOID,
+                                              ULONG,
+                                              PULONG);
+
+  /* Pointer to the function 'ZwQueryInformationProcess()'. */
+  static QueryInformationProcess fnQueryInformationProcess = NULL;
+#endif /* LOG_IMAGE_FILENAME */
 
 
 /******************************************************************************
@@ -57,9 +69,11 @@ static void deferred_io_workitem(PFLT_DEFERRED_IO_WORKITEM FltWorkItem,
                                  PFLT_CALLBACK_DATA CallbackData,
                                  PVOID Context);
 
-static BOOLEAN get_process_image_filename(PEPROCESS process,
-                                          void* buf,
-                                          size_t len);
+#if LOG_IMAGE_FILENAME
+  static BOOLEAN get_process_image_filename(PEPROCESS process,
+                                            void* buf,
+                                            size_t len);
+#endif /* LOG_IMAGE_FILENAME */
 
 #ifdef ALLOC_PRAGMA
   #pragma alloc_text(INIT, DriverEntry)
@@ -72,9 +86,21 @@ static BOOLEAN get_process_image_filename(PEPROCESS process,
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
                      _In_ PUNICODE_STRING RegistryPath)
 {
+#if LOG_IMAGE_FILENAME
+  UNICODE_STRING name;
+#endif
+
   NTSTATUS status;
 
   UNREFERENCED_PARAMETER(RegistryPath);
+
+#if LOG_IMAGE_FILENAME
+  RtlInitUnicodeString(&name, L"ZwQueryInformationProcess");
+
+  /* Get a pointer to the function 'ZwQueryInformationProcess()'. */
+  fnQueryInformationProcess = (QueryInformationProcess)
+                              (ULONG_PTR) MmGetSystemRoutineAddress(&name);
+#endif /* LOG_IMAGE_FILENAME */
 
   /* Register with the filter manager. */
   status = FltRegisterFilter(DriverObject,
@@ -179,27 +205,34 @@ NTSTATUS process_irp(PFLT_CALLBACK_DATA Data,
   PEPROCESS process;
   ULONG pid;
   char buf[sizeof(UNICODE_STRING) + (sizeof(WCHAR) * EXE_MAX_LEN)];
-  PUNICODE_STRING filename;
+  PUNICODE_STRING exe;
 #endif // LOG_IMAGE_FILENAME
 
   /* Get name information. */
   if (get_file_name_information(Data, &name_info)) {
     if (find_extension(&name_info->Extension)) {
 #if LOG_IMAGE_FILENAME
-      filename = (PUNICODE_STRING) buf;
-      filename->Buffer = (WCHAR*) (buf + sizeof(UNICODE_STRING));
-      filename->Length = 0;
-      filename->MaximumLength = EXE_MAX_LEN;
+      if (fnQueryInformationProcess) {
+        exe = (PUNICODE_STRING) buf;
+        exe->Buffer = (WCHAR*) (buf + sizeof(UNICODE_STRING));
+        exe->Length = 0;
+        exe->MaximumLength = EXE_MAX_LEN;
 
-      /* Get process image filename. */
-      if (((pid = FltGetRequestorProcessId(Data)) != 0) &&
-          ((process = FltGetRequestorProcess(Data)) != NULL) &&
-          (get_process_image_filename(process, buf, sizeof(buf)))) {
-        DbgPrint("[PID: %u, image: '%wZ'] Filename: '%wZ', extension: '%wZ'.",
-                 pid,
-                 filename,
-                 &name_info->Name,
-                 &name_info->Extension);
+        /* Get process image filename. */
+        if (((pid = FltGetRequestorProcessId(Data)) != 0) &&
+            ((process = FltGetRequestorProcess(Data)) != NULL) &&
+            (get_process_image_filename(process, buf, sizeof(buf)))) {
+          DbgPrint("[PID: %u, executable: '%wZ'] Filename: '%wZ', "
+                   "extension: '%wZ'.",
+                   pid,
+                   exe,
+                   &name_info->Name,
+                   &name_info->Extension);
+        } else {
+          DbgPrint("Filename: '%wZ', extension: '%wZ'.",
+                   &name_info->Name,
+                   &name_info->Extension);
+        }
       } else {
         DbgPrint("Filename: '%wZ', extension: '%wZ'.",
                  &name_info->Name,
@@ -379,52 +412,34 @@ void deferred_io_workitem(PFLT_DEFERRED_IO_WORKITEM FltWorkItem,
                                 NULL);
 }
 
-BOOLEAN get_process_image_filename(PEPROCESS process, void* buf, size_t len)
-{
-  typedef NTSTATUS (*QueryInformationProcess)(HANDLE,
-                                              PROCESSINFOCLASS,
-                                              PVOID,
-                                              ULONG,
-                                              PULONG);
+#if LOG_IMAGE_FILENAME
+  BOOLEAN get_process_image_filename(PEPROCESS process, void* buf, size_t len)
+  {
+    HANDLE hProcess;
+    NTSTATUS status;
 
-  static QueryInformationProcess fnQueryInformationProcess = NULL;
+    PAGED_CODE();
 
-  HANDLE hProcess;
-  NTSTATUS status;
+    /* Get process handle. */
+    if (NT_SUCCESS(ObOpenObjectByPointer(process,
+                                         OBJ_KERNEL_HANDLE,
+                                         NULL,
+                                         0,
+                                         0,
+                                         KernelMode,
+                                         &hProcess))) {
+      /* Get process image filename. */
+      status = fnQueryInformationProcess(hProcess,
+                                         ProcessImageFileName,
+                                         buf,
+                                         len,
+                                         NULL);
 
-  PAGED_CODE();
+      ZwClose(hProcess);
 
-  if (!fnQueryInformationProcess) {
-    UNICODE_STRING name;
-    RtlInitUnicodeString(&name, L"ZwQueryInformationProcess");
-
-    /* Get a pointer to the function 'ZwQueryInformationProcess'. */
-    if ((fnQueryInformationProcess =
-         (QueryInformationProcess)
-         (ULONG_PTR) MmGetSystemRoutineAddress(&name)) == NULL) {
-      return FALSE;
+      return NT_SUCCESS(status) ? TRUE : FALSE;
     }
-  }
 
-  /* Get process handle. */
-  if (!NT_SUCCESS(ObOpenObjectByPointer(process,
-                                        0,
-                                        NULL,
-                                        0,
-                                        0,
-                                        KernelMode,
-                                        &hProcess))) {
     return FALSE;
   }
-
-  /* Get process image filename. */
-  status = fnQueryInformationProcess(hProcess,
-                                     ProcessImageFileName,
-                                     buf,
-                                     len,
-                                     NULL);
-
-  ZwClose(hProcess);
-
-  return NT_SUCCESS(status);
-}
+#endif /* LOG_IMAGE_FILENAME */
